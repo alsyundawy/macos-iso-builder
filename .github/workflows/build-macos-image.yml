@@ -1,5 +1,57 @@
 name: Build Full Installer ISO/DMG image
 
+# ==============================================================================
+# DOCNOTE
+# ==============================================================================
+# Purpose:
+#   Build a full macOS installer ISO or DMG image by running the repository's
+#   mkmaciso script on a GitHub-hosted macOS Intel runner.
+#
+# Scope:
+#   - ISO output is intended for virtual machine installation workflows.
+#   - DMG IMG output is intended for raw flashing to USB or conversion to another
+#     virtual-disk format when required.
+#
+# Design notes:
+#   1. The old fork/star preflight lookup was removed because it could skip the
+#      build job when it found a third-party fork artifact, leaving this workflow
+#      without its own output.
+#   2. Inputs are validated in a dedicated preflight job before the macOS runner
+#      is allocated.
+#   3. GitHub expression values are passed into shell scripts through env blocks,
+#      not interpolated directly into shell logic.
+#   4. The build job uses an Intel macOS runner because mkmaciso itself recommends
+#      x86_64 Intel macOS for optimal results and because macOS VM installer media
+#      workflows are commonly Intel-oriented.
+#   5. Output detection is strict:
+#        - image_format=iso accepts exactly one *.iso file.
+#        - image_format=dmg accepts exactly one *.dmg.img file.
+#      This avoids unsafe wildcard expansion such as basename *.iso.
+#   6. actions/upload-artifact@v7 with archive:false supports unzipped single-file
+#      upload. Therefore this workflow uploads exactly one output file.
+#   7. mkmaciso is syntax-checked with bash -n before execution.
+#
+# Operational notes:
+#   - Full macOS installers are large. If the runner does not have enough free
+#     workspace storage, mkmaciso can still fail even when the YAML is correct.
+#   - Re-run only after checking the job log section "System Information" and the
+#     free-space line printed before mkmaciso starts.
+#
+# ==============================================================================
+# CHANGELOG
+# ==============================================================================
+# 2026-06-14
+#   - Removed third-party fork/stargazer preflight search logic.
+#   - Added explicit input validation for macOS version and image format.
+#   - Added least-privilege workflow permissions.
+#   - Added concurrency guard per selected macOS version and output format.
+#   - Added mkmaciso existence, executable-bit, and bash syntax checks.
+#   - Replaced unsafe basename wildcard output detection with strict array logic.
+#   - Added exact single-file validation before artifact upload.
+#   - Added artifact URL and digest to the GitHub step summary when available.
+#   - Hardened all embedded Bash blocks with set -Eeuo pipefail and safe quoting.
+# ==============================================================================
+
 on:
   workflow_dispatch:
     inputs:
@@ -33,165 +85,291 @@ on:
           - 'iso'
           - 'dmg'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: full-installer-${{ github.ref }}-${{ inputs.macos_version }}-${{ inputs.image_format }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   preflight:
-    if: ${{ inputs.macos_version != '' && inputs.image_format != '' }}
     runs-on: ubuntu-slim
     timeout-minutes: 5
     outputs:
-      _build: ${{ steps.check.outputs._build }}
+      build: ${{ steps.validate.outputs.build }}
 
     steps:
-      - name: Preflight
-        id: check
+      - name: Validate workflow inputs
+        id: validate
+        env:
+          MACOS_VERSION: ${{ inputs.macos_version }}
+          IMAGE_FORMAT: ${{ inputs.image_format }}
         run: |
-          # Third time's the charm
-          if [ ${{ github.run_attempt }} -ge 3 ]; then
-            echo "_build=true" >> $GITHUB_OUTPUT
+          set -Eeuo pipefail
+
+          append_summary() {
+            printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          build='true'
+
+          if [ -z "$MACOS_VERSION" ]; then
+            append_summary '## Build skipped'
+            append_summary ''
+            append_summary 'No macOS version was selected. Re-run the workflow and select a valid macOS version.'
+            build='false'
+          fi
+
+          if [ -z "$IMAGE_FORMAT" ]; then
+            append_summary '## Build skipped'
+            append_summary ''
+            append_summary 'No image format was selected. Re-run the workflow and select either `iso` or `dmg`.'
+            build='false'
+          fi
+
+          if [ "$build" = 'false' ]; then
+            printf 'build=false\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          FOUND=false
-          PAGE=1
-          while [ $PAGE -le 50 ]; do
-            DATA=$(curl -s \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/LongQT-sea/macos-iso-builder/stargazers?per_page=100&page=${PAGE}")
-            echo "$DATA" | jq -e --arg user "$GITHUB_ACTOR" 'any(.[]; .login == $user)' > /dev/null && FOUND=true && break
-            [ "$(echo "$DATA" | grep -c '"login"')" -lt 100 ] && break
-            PAGE=$((PAGE + 1))
-          done
+          case "$MACOS_VERSION" in
+            'Tahoe'|'Sequoia'|'Sonoma'|'Ventura'|'Monterey'|'Big Sur'|'Catalina'|'Mojave'|'High Sierra'|'Sierra'|'El Capitan'|'Yosemite'|'Mavericks'|'Mountain Lion'|'Lion')
+              ;;
+            *)
+              append_summary '## Invalid macOS version'
+              append_summary ''
+              append_summary "Unsupported macOS version: \`$MACOS_VERSION\`."
+              printf 'build=false\n' >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
 
-          if [ "$FOUND" = "false" ]; then
-            VERSION_NORMALIZED=$(echo "${{ inputs.macos_version }}" | tr ' ' '_')
-            FORMAT="${{ inputs.image_format }}"
-            FOUND_RUN_URL=""
-            FOUND_ARTIFACT_NAME=""
-            PAST_15_DAYS=$(date -u -d '15 days ago' +%Y-%m-%dT%H:%M:%SZ)
-            PAGE=1
+          case "$IMAGE_FORMAT" in
+            iso|dmg)
+              ;;
+            *)
+              append_summary '## Invalid image format'
+              append_summary ''
+              append_summary "Unsupported image format: \`$IMAGE_FORMAT\`."
+              printf 'build=false\n' >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
 
-            while true; do
-              FORKS=$(curl -s \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                "https://api.github.com/repos/LongQT-sea/macos-iso-builder/forks?sort=newest&per_page=100&page=${PAGE}")
-              [ "$(echo "$FORKS" | jq 'length')" -eq 0 ] && break
-              RECENT=$(echo "$FORKS" | jq -r --arg date "$PAST_15_DAYS" \
-                '.[] | select(.created_at > $date) | .full_name')
-              [ -z "$RECENT" ] && break
-              while IFS= read -r fork_full_name; do
-                [ -z "$fork_full_name" ] && continue
-                RUN_ID=$(curl -s \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                  "https://api.github.com/repos/${fork_full_name}/actions/runs?status=success&per_page=10" \
-                  | jq -r --arg date "$PAST_15_DAYS" '
-                    .workflow_runs[]
-                    | select(.name == "Build Full Installer ISO/DMG image")
-                    | select(.created_at > $date)
-                    | .id' | head -1)
-                [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ] && continue
-                MATCH=$(curl -s \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                  "https://api.github.com/repos/${fork_full_name}/actions/runs/${RUN_ID}/artifacts" \
-                  | jq -r --arg v "macOS_${VERSION_NORMALIZED}" --arg f "$FORMAT" '
-                    .artifacts[]
-                    | select(.name | startswith($v) and (endswith($f) or endswith($f + ".img")))
-                    | select(.expired == false)
-                    | .name' | head -1)
-                if [ -n "$MATCH" ] && [ "$MATCH" != "null" ]; then
-                  FOUND_RUN_URL="https://github.com/${fork_full_name}/actions/runs/${RUN_ID}"
-                  FOUND_ARTIFACT_NAME="$MATCH"
-                  break 2
-                fi
-              done < <(echo "$RECENT")
-              PAGE=$((PAGE + 1))
-            done
+          append_summary '## Preflight passed'
+          append_summary ''
+          append_summary "macOS version: \`$MACOS_VERSION\`"
+          append_summary "Image format: \`$IMAGE_FORMAT\`"
 
-            if [ -n "$FOUND_RUN_URL" ]; then
-              echo "## Found **${FOUND_ARTIFACT_NAME}** in a recent fork" >> $GITHUB_STEP_SUMMARY
-              echo "**[${FOUND_RUN_URL}](${FOUND_RUN_URL})**" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "1. Open the link above" >> $GITHUB_STEP_SUMMARY
-              echo "2. Scroll down to the **Artifacts** section" >> $GITHUB_STEP_SUMMARY
-              echo "3. Click **${FOUND_ARTIFACT_NAME}** to download" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> [!TIP]" >> $GITHUB_STEP_SUMMARY
-              echo "> Want to build your own latest version? Star :star: [LongQT-sea/macos-iso-builder](https://github.com/LongQT-sea/macos-iso-builder) to skip this search and go straight to build next time." >> $GITHUB_STEP_SUMMARY
-              echo "> <br>![star](https://raw.githubusercontent.com/LongQT-sea/macos-iso-builder/main/.github/star.jpg)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "No recent builds found in forks. Starting build..." >> $GITHUB_STEP_SUMMARY
-              echo "Star :star: [LongQT-sea/macos-iso-builder](https://github.com/LongQT-sea/macos-iso-builder) to skip this search and go straight to build next time." >> $GITHUB_STEP_SUMMARY
-              echo "<br>![star](https://raw.githubusercontent.com/LongQT-sea/macos-iso-builder/main/.github/star.jpg)" >> $GITHUB_STEP_SUMMARY
-              echo "_build=true" >> $GITHUB_OUTPUT
-            fi
-            exit 0
-          fi
-
-          echo "_build=true" >> $GITHUB_OUTPUT
+          printf 'build=true\n' >> "$GITHUB_OUTPUT"
 
   build-macos-image:
     needs: preflight
-    if: needs.preflight.outputs._build == 'true'
+    if: needs.preflight.outputs.build == 'true'
     runs-on: macos-15-intel
-    timeout-minutes: 80
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: System Information
         run: |
-          echo "Runner OS: $(sw_vers -productName) $(sw_vers -productVersion)"
-          echo "Architecture: $(uname -m)"
-          echo ""
-          df -h $(mktemp)
-          echo ""
-          echo "RAM: $(top -l 1 | grep PhysMem)"
-          echo ""
-          echo "CPU: $(sysctl -n machdep.cpu.brand_string)"
+          set -Eeuo pipefail
+
+          tmp_probe="$(mktemp)"
+          trap 'rm -f "$tmp_probe"' EXIT
+
+          printf 'Runner OS: %s %s\n' "$(sw_vers -productName)" "$(sw_vers -productVersion)"
+          printf 'Architecture: %s\n' "$(uname -m)"
+          printf '\nDisk for temporary probe:\n'
+          df -h "$tmp_probe"
+          printf '\nDisk for workspace:\n'
+          df -h "$GITHUB_WORKSPACE"
+          printf '\nRAM: %s\n' "$(top -l 1 | grep 'PhysMem' || true)"
+          printf '\nCPU: %s\n' "$(sysctl -n machdep.cpu.brand_string)"
+          printf 'Bash version: %s\n' "$BASH_VERSION"
+          printf 'Python version: %s\n' "$(python3 --version 2>/dev/null || true)"
+          printf 'hdiutil version: %s\n' "$(hdiutil version | head -n 1)"
+          printf 'softwareupdate path: %s\n' "$(command -v softwareupdate || true)"
+
+      - name: Validate mkmaciso
+        run: |
+          set -Eeuo pipefail
+
+          if [ ! -f './mkmaciso' ]; then
+            printf 'Required script not found: ./mkmaciso\n' >&2
+            exit 1
+          fi
+
+          chmod +x ./mkmaciso
+
+          if [ ! -x './mkmaciso' ]; then
+            printf 'Required script is not executable after chmod: ./mkmaciso\n' >&2
+            exit 1
+          fi
+
+          bash -n ./mkmaciso
+          printf 'mkmaciso syntax check passed.\n'
 
       - name: Create macOS image
         id: create_image
+        env:
+          MACOS_VERSION: ${{ inputs.macos_version }}
+          IMAGE_FORMAT: ${{ inputs.image_format }}
         run: |
-          ./mkmaciso "${{ inputs.macos_version }}" "${{ inputs.image_format }}"
-          if [ "${{ inputs.image_format }}" == "iso" ]; then
-            echo "image_name=$(basename *.iso)" >> $GITHUB_OUTPUT
+          set -Eeuo pipefail
+          shopt -s nullglob
+
+          append_summary() {
+            printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          case "$IMAGE_FORMAT" in
+            iso)
+              expected_glob='*.iso'
+              ;;
+            dmg)
+              expected_glob='*.dmg.img'
+              ;;
+            *)
+              printf 'Unsupported image format: %s\n' "$IMAGE_FORMAT" >&2
+              exit 1
+              ;;
+          esac
+
+          printf 'Requested macOS version: %s\n' "$MACOS_VERSION"
+          printf 'Requested image format: %s\n' "$IMAGE_FORMAT"
+
+          printf '\nWorkspace before build:\n'
+          pwd
+          find . -maxdepth 1 -type f -print | sort
+
+          printf '\nAvailable workspace storage before build:\n'
+          df -h "$GITHUB_WORKSPACE"
+
+          printf '\nRunning mkmaciso...\n'
+          ./mkmaciso "$MACOS_VERSION" "$IMAGE_FORMAT"
+
+          printf '\nWorkspace after build:\n'
+          find . -maxdepth 1 -type f -print | sort
+
+          if [ "$IMAGE_FORMAT" = 'iso' ]; then
+            output_files=( ./*.iso )
           else
-            echo "image_name=$(basename *.dmg.img)" >> $GITHUB_OUTPUT
+            output_files=( ./*.dmg.img )
           fi
 
+          if [ "${#output_files[@]}" -eq 0 ]; then
+            printf 'No output file matched expected pattern: %s\n' "$expected_glob" >&2
+            exit 1
+          fi
+
+          if [ "${#output_files[@]}" -gt 1 ]; then
+            printf 'More than one output file matched expected pattern: %s\n' "$expected_glob" >&2
+            printf 'Matched files:\n' >&2
+            printf ' - %s\n' "${output_files[@]}" >&2
+            exit 1
+          fi
+
+          image_path="${output_files[0]}"
+          image_name="$(basename "$image_path")"
+
+          if [ ! -s "$image_path" ]; then
+            printf 'Output file is missing or empty: %s\n' "$image_path" >&2
+            exit 1
+          fi
+
+          image_size="$(du -h "$image_path" | awk '{print $1}')"
+          image_sha256="$(shasum -a 256 "$image_path" | awk '{print $1}')"
+
+          printf 'Image created successfully: %s (%s)\n' "$image_name" "$image_size"
+          printf 'SHA256: %s\n' "$image_sha256"
+
+          {
+            printf 'image_path=%s\n' "$image_path"
+            printf 'image_name=%s\n' "$image_name"
+            printf 'image_size=%s\n' "$image_size"
+            printf 'image_sha256=%s\n' "$image_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+          append_summary '## Build output created'
+          append_summary ''
+          append_summary "File: \`$image_name\`"
+          append_summary "Size: \`$image_size\`"
+          append_summary "SHA256: \`$image_sha256\`"
+
       - name: Upload artifact
+        id: upload_artifact
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ steps.create_image.outputs.image_name }}
+          path: ${{ steps.create_image.outputs.image_path }}
           compression-level: 0
           retention-days: 15
+          if-no-files-found: error
           archive: false
 
       - name: Summary
         if: always()
+        env:
+          CREATE_IMAGE_OUTCOME: ${{ steps.create_image.outcome }}
+          JOB_STATUS: ${{ job.status }}
+          MACOS_VERSION: ${{ inputs.macos_version }}
+          IMAGE_FORMAT: ${{ inputs.image_format }}
+          IMAGE_NAME: ${{ steps.create_image.outputs.image_name }}
+          IMAGE_SIZE: ${{ steps.create_image.outputs.image_size }}
+          IMAGE_SHA256: ${{ steps.create_image.outputs.image_sha256 }}
+          ARTIFACT_URL: ${{ steps.upload_artifact.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.upload_artifact.outputs.artifact-digest }}
         run: |
-          if [ "${{ steps.create_image.outcome }}" == "failure" ]; then
-            echo "## Download macOS failed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> [!WARNING]" >> $GITHUB_STEP_SUMMARY
-            echo "> This runner may have network issues. Please **re-run the workflow** to try a different runner." >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ job.status }}" == "success" ]; then
-            if [ "${{ inputs.image_format }}" == "iso" ]; then
-              echo "## Successfully built $(basename *.iso)" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> [!Important]" >> $GITHUB_STEP_SUMMARY
-              echo "> This ISO image is intended for creating macOS virtual machines on Proxmox VE, QEMU, VMware, and VirtualBox." >> $GITHUB_STEP_SUMMARY
-            else
-              echo "## Successfully built $(basename *.dmg.img)" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "> [!Important]" >> $GITHUB_STEP_SUMMARY
-              echo '> This DMG image is intended for flashing to USB drive using [Rufus](https://rufus.ie/en/#download) *(Windows)* or `dd` *(Linux)*.' >> $GITHUB_STEP_SUMMARY
+          set -Eeuo pipefail
+
+          append_summary() {
+            printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if [ "$CREATE_IMAGE_OUTCOME" = 'failure' ]; then
+            append_summary '## Build failed'
+            append_summary ''
+            append_summary '> [!WARNING]'
+            append_summary '> mkmaciso failed while downloading macOS, creating the installer image, or writing the final output.'
+            append_summary ''
+            append_summary 'Check the following log sections first:'
+            append_summary ''
+            append_summary '1. `System Information` for runner architecture and free storage.'
+            append_summary '2. `Validate mkmaciso` for script syntax or executable-bit problems.'
+            append_summary '3. `Create macOS image` for the exact mkmaciso failure.'
+          elif [ "$JOB_STATUS" = 'success' ]; then
+            append_summary "## Successfully built **$IMAGE_NAME**"
+            append_summary ''
+            append_summary "macOS version: \`$MACOS_VERSION\`"
+            append_summary "Image format: \`$IMAGE_FORMAT\`"
+            append_summary "File size: \`$IMAGE_SIZE\`"
+            append_summary "SHA256: \`$IMAGE_SHA256\`"
+
+            if [ -n "$ARTIFACT_DIGEST" ]; then
+              append_summary "Artifact digest: \`$ARTIFACT_DIGEST\`"
             fi
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> [!TIP]" >> $GITHUB_STEP_SUMMARY
-            echo "> Enable [Cloudflare WARP](https://one.one.one.one/) for faster download from GitHub artifact." >> $GITHUB_STEP_SUMMARY
+
+            if [ -n "$ARTIFACT_URL" ]; then
+              append_summary ''
+              append_summary "[Open artifact]($ARTIFACT_URL)"
+            fi
+
+            append_summary ''
+
+            if [ "$IMAGE_FORMAT" = 'iso' ]; then
+              append_summary '> [!IMPORTANT]'
+              append_summary '> This ISO image is intended for creating macOS virtual machines on Proxmox VE, QEMU/KVM, VMware, and VirtualBox.'
+            else
+              append_summary '> [!IMPORTANT]'
+              append_summary '> This DMG IMG image is intended for flashing to a USB drive using Rufus on Windows or `dd` on Linux.'
+            fi
           fi
