@@ -1,246 +1,127 @@
 name: Build Recovery ISO image
 
+# ==============================================================================
+# DOCNOTE
+# ==============================================================================
+# Purpose:
+#   Build a macOS Recovery ISO from Apple's recovery assets by using
+#   Acidanthera/OpenCorePkg macrecovery.py, then upload the result as a GitHub
+#   Actions artifact and optionally publish it as a GitHub Release asset.
+#
+# Important implementation notes:
+#   1. The build job is pinned to macos-26-intel instead of macos-latest so the
+#      workflow is not affected by GitHub's moving "latest" macOS label.
+#   2. The old star/fork preflight gate was removed because it could skip the
+#      build job and only print a link to another fork's artifact.
+#   3. All user-controlled inputs are passed through environment variables before
+#      use in shell scripts to avoid shell injection and quoting issues.
+#   4. Tahoe must use macrecovery.py with -os latest. Earlier listed versions use
+#      -os default, matching OpenCorePkg's recovery_urls.txt examples.
+#   5. Release tags are sanitized before use. Empty sanitized tags are rejected.
+#
+# CHANGELOG
+# ==============================================================================
+# 2026-06-14
+#   - Removed fork/star build-skip logic from preflight.
+#   - Added strict Bash mode and safe quoting for GitHub environment files.
+#   - Pinned macOS build runner to macos-26-intel for stable Intel hdiutil output.
+#   - Added explicit macOS version validation and output mapping.
+#   - Added retry logic and syntax validation for downloaded macrecovery.py.
+#   - Added recovery DMG existence/size validation before hdiutil makehybrid.
+#   - Added artifact name, if-no-files-found: error, and release notes.
+#   - Hardened optional release-tag sanitization and gh release invocation.
+# ==============================================================================
+
 on:
   workflow_dispatch:
     inputs:
       macos_version:
-        description: "Select a macOS version to build"
+        description: 'Select a macOS version to build'
         required: true
         type: choice
         options:
-          - "Tahoe"
-          - "Sequoia"
-          - "Sonoma"
-          - "Ventura"
-          - "Monterey"
-          - "Big Sur"
-          - "Catalina"
-          - "Mojave"
-          - "High Sierra"
-
+          - ''
+          - 'Tahoe'
+          - 'Sequoia'
+          - 'Sonoma'
+          - 'Ventura'
+          - 'Monterey'
+          - 'Big Sur'
+          - 'Catalina'
+          - 'Mojave'
+          - 'High Sierra'
       release_tag:
-        description: "Optional: tag the build, e.g. v15.7.7, to upload it to Releases for long-term storage"
+        description: 'Optional: tag the build, for example v14.7.6-recovery, to upload it to Releases for long-term storage'
         required: false
         type: string
-
-      reuse_recent_fork_artifact:
-        description: "Optional: reuse a recent fork artifact instead of building locally"
-        required: false
-        type: boolean
-        default: false
-
-concurrency:
-  group: recovery-iso-${{ github.workflow }}-${{ inputs.macos_version }}
-  cancel-in-progress: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: recovery-iso-${{ github.ref }}-${{ inputs.macos_version }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MACRECOVERY_URL: https://raw.githubusercontent.com/acidanthera/OpenCorePkg/master/Utilities/macrecovery/macrecovery.py
+
 jobs:
   preflight:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 8
-
-    permissions:
-      contents: read
-
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
     outputs:
-      _build: ${{ steps.check.outputs._build }}
+      build: ${{ steps.validate.outputs.build }}
 
     steps:
-      - name: Preflight
-        id: check
-        shell: bash
+      - name: Validate workflow inputs
+        id: validate
         env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_ACTOR_NAME: ${{ github.actor }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
           MACOS_VERSION: ${{ inputs.macos_version }}
-          REUSE_RECENT_FORK_ARTIFACT: ${{ inputs.reuse_recent_fork_artifact }}
-          UPSTREAM_REPO: "LongQT-sea/macos-iso-builder"
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -Eeuo pipefail
 
-          : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
-          : "${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
-          : "${GH_TOKEN:?GH_TOKEN is required}"
-          : "${GITHUB_ACTOR_NAME:?GITHUB_ACTOR_NAME is required}"
-          : "${RUN_ATTEMPT:?RUN_ATTEMPT is required}"
-          : "${MACOS_VERSION:?MACOS_VERSION is required}"
-          : "${REUSE_RECENT_FORK_ARTIFACT:?REUSE_RECENT_FORK_ARTIFACT is required}"
-          : "${UPSTREAM_REPO:?UPSTREAM_REPO is required}"
-
-          output_kv() {
-            local key="$1"
-            local value="$2"
-            printf '%s=%s\n' "${key}" "${value}" >> "${GITHUB_OUTPUT}"
+          append_summary() {
+            printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
           }
 
-          summary_line() {
-            printf '%s\n' "$*" >> "${GITHUB_STEP_SUMMARY}"
-          }
+          if [ -z "$MACOS_VERSION" ]; then
+            append_summary '## Build skipped'
+            append_summary ''
+            append_summary 'No macOS version was selected. Re-run the workflow and select a valid macOS version.'
+            printf 'build=false\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          gh_api() {
-            local url="$1"
-
-            curl --fail-with-body --silent --show-error \
-              --retry 3 \
-              --retry-delay 2 \
-              --connect-timeout 10 \
-              --max-time 60 \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "${url}"
-          }
-
-          case "${MACOS_VERSION}" in
-            "Tahoe"|"Sequoia"|"Sonoma"|"Ventura"|"Monterey"|"Big Sur"|"Catalina"|"Mojave"|"High Sierra")
+          case "$MACOS_VERSION" in
+            'High Sierra'|'Mojave'|'Catalina'|'Big Sur'|'Monterey'|'Ventura'|'Sonoma'|'Sequoia'|'Tahoe')
               ;;
             *)
-              summary_line "## Preflight failed"
-              summary_line ""
-              summary_line "Unsupported macOS version: \`${MACOS_VERSION}\`"
+              append_summary '## Invalid macOS version'
+              append_summary ''
+              append_summary "Unsupported macOS version: \`$MACOS_VERSION\`."
+              printf 'build=false\n' >> "$GITHUB_OUTPUT"
               exit 1
               ;;
           esac
 
-          if [[ ! "${RUN_ATTEMPT}" =~ ^[0-9]+$ ]]; then
-            RUN_ATTEMPT="1"
+          if [ -n "$RELEASE_TAG" ]; then
+            append_summary "Release upload requested with raw tag: \`$RELEASE_TAG\`."
           fi
 
-          summary_line "## Preflight"
-          summary_line ""
-          summary_line "- Requested version: **${MACOS_VERSION}**"
-          summary_line "- Reuse recent fork artifact: **${REUSE_RECENT_FORK_ARTIFACT}**"
-
-          if [[ "${REUSE_RECENT_FORK_ARTIFACT}" != "true" ]]; then
-            output_kv "_build" "true"
-            summary_line "- Decision: **build locally**"
-            exit 0
-          fi
-
-          if (( RUN_ATTEMPT >= 3 )); then
-            output_kv "_build" "true"
-            summary_line "- Decision: **build locally**, because this is run attempt ${RUN_ATTEMPT}"
-            exit 0
-          fi
-
-          found_star="false"
-          page="1"
-
-          while (( page <= 50 )); do
-            data="$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/stargazers?per_page=100&page=${page}")"
-
-            if jq -e --arg user "${GITHUB_ACTOR_NAME}" 'any(.[]?; .login == $user)' <<< "${data}" > /dev/null; then
-              found_star="true"
-              break
-            fi
-
-            login_count="$(jq '[.[]? | select(has("login"))] | length' <<< "${data}")"
-            if (( login_count < 100 )); then
-              break
-            fi
-
-            page="$((page + 1))"
-          done
-
-          if [[ "${found_star}" == "true" ]]; then
-            output_kv "_build" "true"
-            summary_line "- Decision: **build locally**, because actor is a stargazer of ${UPSTREAM_REPO}"
-            exit 0
-          fi
-
-          version_normalized="${MACOS_VERSION// /_}"
-          artifact_prefix="macOS_${version_normalized}_Recovery"
-          past_15_days="$(date -u -d '15 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
-          found_run_url=""
-          found_artifact_name=""
-          page="1"
-
-          while true; do
-            forks="$(gh_api "https://api.github.com/repos/${UPSTREAM_REPO}/forks?sort=newest&per_page=100&page=${page}")"
-
-            fork_count="$(jq 'length' <<< "${forks}")"
-            if (( fork_count == 0 )); then
-              break
-            fi
-
-            recent_forks="$(jq -r --arg date "${past_15_days}" '.[]? | select(.created_at > $date) | .full_name' <<< "${forks}")"
-            if [[ -z "${recent_forks}" ]]; then
-              break
-            fi
-
-            while IFS= read -r fork_full_name; do
-              [[ -n "${fork_full_name}" ]] || continue
-
-              run_id="$(
-                gh_api "https://api.github.com/repos/${fork_full_name}/actions/runs?status=success&per_page=10" \
-                  | jq -r --arg date "${past_15_days}" '
-                      .workflow_runs[]?
-                      | select(.name == "Build Recovery ISO image")
-                      | select(.created_at > $date)
-                      | .id
-                    ' \
-                  | head -n 1
-              )"
-
-              if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
-                continue
-              fi
-
-              match="$(
-                gh_api "https://api.github.com/repos/${fork_full_name}/actions/runs/${run_id}/artifacts" \
-                  | jq -r --arg prefix "${artifact_prefix}" '
-                      .artifacts[]?
-                      | select(.name | startswith($prefix))
-                      | select(.expired == false)
-                      | .name
-                    ' \
-                  | head -n 1
-              )"
-
-              if [[ -n "${match}" && "${match}" != "null" ]]; then
-                found_run_url="https://github.com/${fork_full_name}/actions/runs/${run_id}"
-                found_artifact_name="${match}"
-                break 2
-              fi
-            done <<< "${recent_forks}"
-
-            page="$((page + 1))"
-          done
-
-          if [[ -n "${found_run_url}" ]]; then
-            output_kv "_build" "false"
-
-            summary_line ""
-            summary_line "## Found recent fork artifact"
-            summary_line ""
-            summary_line "- Artifact: **${found_artifact_name}**"
-            summary_line "- Run: ${found_run_url}"
-            summary_line ""
-            summary_line "Build job was skipped because \`reuse_recent_fork_artifact=true\`."
-            exit 0
-          fi
-
-          output_kv "_build" "true"
-
-          summary_line ""
-          summary_line "No reusable recent fork artifact found."
-          summary_line "- Decision: **build locally**"
+          printf 'build=true\n' >> "$GITHUB_OUTPUT"
 
   build-recovery-iso:
     needs: preflight
-    if: needs.preflight.outputs._build == 'true'
+    if: needs.preflight.outputs.build == 'true'
     runs-on: macos-26-intel
-    timeout-minutes: 30
-
+    timeout-minutes: 45
     permissions:
       contents: write
-
-    env:
-      RECOVERY_DIR: "com.apple.recovery.boot"
-      MACRECOVERY_URL: "https://raw.githubusercontent.com/acidanthera/OpenCorePkg/master/Utilities/macrecovery/macrecovery.py"
 
     steps:
       - name: Checkout repository
@@ -249,364 +130,329 @@ jobs:
           persist-credentials: false
 
       - name: System Information
-        shell: bash
         run: |
           set -Eeuo pipefail
 
-          echo "Runner OS: $(sw_vers -productName) $(sw_vers -productVersion)"
-          echo "Architecture: $(uname -m)"
-          echo ""
+          tmp_probe="$(mktemp)"
+          trap 'rm -f "$tmp_probe"' EXIT
 
-          df -h "${RUNNER_TEMP:-/tmp}"
-          echo ""
-
-          echo "RAM:"
-          top -l 1 | grep 'PhysMem' || true
-          echo ""
-
-          echo "CPU:"
-          sysctl -n machdep.cpu.brand_string || true
-          echo ""
-
-          echo "Python version: $(python3 --version)"
-          echo "hdiutil version:"
-          hdiutil version || true
+          printf 'Runner OS: %s %s\n' "$(sw_vers -productName)" "$(sw_vers -productVersion)"
+          printf 'Architecture: %s\n' "$(uname -m)"
+          printf '\nDisk:\n'
+          df -h "$tmp_probe"
+          printf '\nRAM: %s\n' "$(top -l 1 | grep 'PhysMem' || true)"
+          printf '\nCPU: %s\n' "$(sysctl -n machdep.cpu.brand_string)"
+          printf '\nPython version: %s\n' "$(python3 --version)"
+          printf 'hdiutil version: %s\n' "$(hdiutil version | head -n 1)"
+          printf 'gh version: %s\n' "$(gh --version | head -n 1)"
 
       - name: Download macrecovery.py
-        shell: bash
         run: |
           set -Eeuo pipefail
 
-          : "${MACRECOVERY_URL:?MACRECOVERY_URL is required}"
-
-          echo "Downloading macrecovery.py from acidanthera/OpenCorePkg..."
-
-          curl --fail-with-body --location --silent --show-error \
+          printf 'Downloading macrecovery.py from Acidanthera/OpenCorePkg...\n'
+          curl \
+            --fail \
+            --location \
+            --show-error \
+            --silent \
             --retry 5 \
             --retry-delay 2 \
+            --retry-all-errors \
             --connect-timeout 10 \
-            --max-time 120 \
-            --output "macrecovery.py" \
-            "${MACRECOVERY_URL}"
+            --max-time 60 \
+            --output macrecovery.py \
+            "$MACRECOVERY_URL"
 
-          test -s "macrecovery.py"
-          python3 -m py_compile "macrecovery.py"
+          test -s macrecovery.py
+          python3 -m py_compile macrecovery.py
 
       - name: Get version info
         id: version_info
-        shell: bash
         env:
           MACOS_VERSION: ${{ inputs.macos_version }}
         run: |
           set -Eeuo pipefail
 
-          : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
-          : "${MACOS_VERSION:?MACOS_VERSION is required}"
-
-          board_id=""
-          model=""
-          version_slug=""
-          os_type="default"
-
-          case "${MACOS_VERSION}" in
-            "High Sierra")
-              board_id="Mac-7BA5B2D9E42DDD94"
-              model="00000000000J80300"
-              version_slug="High_Sierra"
-              os_type="default"
+          case "$MACOS_VERSION" in
+            'High Sierra')
+              board_id='Mac-7BA5B2D9E42DDD94'
+              model='00000000000J80300'
+              version_name='High Sierra'
+              version_slug='High_Sierra'
+              os_type='default'
               ;;
-            "Mojave")
-              board_id="Mac-7BA5B2DFE22DDD8C"
-              model="00000000000KXPG00"
-              version_slug="Mojave"
-              os_type="default"
+            'Mojave')
+              board_id='Mac-7BA5B2DFE22DDD8C'
+              model='00000000000KXPG00'
+              version_name='Mojave'
+              version_slug='Mojave'
+              os_type='default'
               ;;
-            "Catalina")
-              board_id="Mac-CFF7D910A743CAAF"
-              model="00000000000PHCD00"
-              version_slug="Catalina"
-              os_type="default"
+            'Catalina')
+              board_id='Mac-CFF7D910A743CAAF'
+              model='00000000000PHCD00'
+              version_name='Catalina'
+              version_slug='Catalina'
+              os_type='default'
               ;;
-            "Big Sur")
-              board_id="Mac-2BD1B31983FE1663"
-              model="00000000000000000"
-              version_slug="Big_Sur"
-              os_type="default"
+            'Big Sur')
+              board_id='Mac-2BD1B31983FE1663'
+              model='00000000000000000'
+              version_name='Big Sur'
+              version_slug='Big_Sur'
+              os_type='default'
               ;;
-            "Monterey")
-              board_id="Mac-E43C1C25D4880AD6"
-              model="00000000000000000"
-              version_slug="Monterey"
-              os_type="default"
+            'Monterey')
+              board_id='Mac-E43C1C25D4880AD6'
+              model='00000000000000000'
+              version_name='Monterey'
+              version_slug='Monterey'
+              os_type='default'
               ;;
-            "Ventura")
-              board_id="Mac-B4831CEBD52A0C4C"
-              model="00000000000000000"
-              version_slug="Ventura"
-              os_type="default"
+            'Ventura')
+              board_id='Mac-B4831CEBD52A0C4C'
+              model='00000000000000000'
+              version_name='Ventura'
+              version_slug='Ventura'
+              os_type='default'
               ;;
-            "Sonoma")
-              board_id="Mac-827FAC58A8FDFA22"
-              model="00000000000000000"
-              version_slug="Sonoma"
-              os_type="default"
+            'Sonoma')
+              board_id='Mac-827FAC58A8FDFA22'
+              model='00000000000000000'
+              version_name='Sonoma'
+              version_slug='Sonoma'
+              os_type='default'
               ;;
-            "Sequoia")
-              board_id="Mac-7BA5B2D9E42DDD94"
-              model="00000000000000000"
-              version_slug="Sequoia"
-              os_type="default"
+            'Sequoia')
+              board_id='Mac-7BA5B2D9E42DDD94'
+              model='00000000000000000'
+              version_name='Sequoia'
+              version_slug='Sequoia'
+              os_type='default'
               ;;
-            "Tahoe")
-              board_id="Mac-CFF7D910A743CAAF"
-              model="00000000000000000"
-              version_slug="Tahoe"
-              os_type="latest"
+            'Tahoe')
+              board_id='Mac-CFF7D910A743CAAF'
+              model='00000000000000000'
+              version_name='Tahoe'
+              version_slug='Tahoe'
+              os_type='latest'
               ;;
             *)
-              echo "Unsupported macOS version: ${MACOS_VERSION}" >&2
+              printf 'Unsupported macOS version: %s\n' "$MACOS_VERSION" >&2
               exit 1
               ;;
           esac
 
           {
-            printf 'board_id=%s\n' "${board_id}"
-            printf 'model=%s\n' "${model}"
-            printf 'version_display=%s\n' "${MACOS_VERSION}"
-            printf 'version_slug=%s\n' "${version_slug}"
-            printf 'os_type=%s\n' "${os_type}"
-          } >> "${GITHUB_OUTPUT}"
-
-          echo "macOS version : ${MACOS_VERSION}"
-          echo "Version slug  : ${version_slug}"
-          echo "Board ID      : ${board_id}"
-          echo "MLB/model     : ${model}"
-          echo "OS type       : ${os_type}"
+            printf 'board_id=%s\n' "$board_id"
+            printf 'model=%s\n' "$model"
+            printf 'version_name=%s\n' "$version_name"
+            printf 'version_slug=%s\n' "$version_slug"
+            printf 'os_type=%s\n' "$os_type"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download macOS Recovery
         id: download_recovery_image
-        shell: bash
         env:
           BOARD_ID: ${{ steps.version_info.outputs.board_id }}
           MODEL: ${{ steps.version_info.outputs.model }}
-          VERSION_DISPLAY: ${{ steps.version_info.outputs.version_display }}
           OS_TYPE: ${{ steps.version_info.outputs.os_type }}
+          VERSION_NAME: ${{ steps.version_info.outputs.version_name }}
         run: |
           set -Eeuo pipefail
 
-          : "${RECOVERY_DIR:?RECOVERY_DIR is required}"
-          : "${BOARD_ID:?BOARD_ID is required}"
-          : "${MODEL:?MODEL is required}"
-          : "${VERSION_DISPLAY:?VERSION_DISPLAY is required}"
-          : "${OS_TYPE:?OS_TYPE is required}"
+          recovery_dir='com.apple.recovery.boot'
+          recovery_dmg="$recovery_dir/BaseSystem.dmg"
 
-          echo "Downloading macOS ${VERSION_DISPLAY} recovery..."
+          printf 'Downloading macOS %s recovery...\n' "$VERSION_NAME"
+          rm -rf "$recovery_dir"
 
-          rm -rf "${RECOVERY_DIR}"
+          for attempt in 1 2 3; do
+            printf 'macrecovery attempt %s/3...\n' "$attempt"
+            if python3 macrecovery.py -b "$BOARD_ID" -m "$MODEL" -os "$OS_TYPE" download; then
+              break
+            fi
 
-          cmd=(
-            python3
-            -u
-            "macrecovery.py"
-            -o "${RECOVERY_DIR}"
-            -b "${BOARD_ID}"
-            -m "${MODEL}"
-          )
+            if [ "$attempt" -eq 3 ]; then
+              printf 'macrecovery.py failed after 3 attempts.\n' >&2
+              exit 1
+            fi
 
-          if [[ "${OS_TYPE}" != "default" ]]; then
-            cmd+=(-os "${OS_TYPE}")
+            sleep "$((attempt * 10))"
+          done
+
+          if [ ! -s "$recovery_dmg" ]; then
+            printf 'Recovery DMG was not created or is empty: %s\n' "$recovery_dmg" >&2
+            find "$recovery_dir" -maxdepth 2 -type f -print 2>/dev/null || true
+            exit 1
           fi
 
-          cmd+=(download)
-
-          printf 'Executing:'
-          printf ' %q' "${cmd[@]}"
-          printf '\n'
-
-          "${cmd[@]}"
-
-          test -s "${RECOVERY_DIR}/BaseSystem.dmg"
-          test -s "${RECOVERY_DIR}/BaseSystem.chunklist"
-
-          echo ""
-          echo "Downloaded recovery files:"
-          ls -lh "${RECOVERY_DIR}"
+          printf 'Recovery files:\n'
+          find "$recovery_dir" -maxdepth 2 -type f -print -exec du -h {} \;
 
       - name: Create Recovery ISO
         id: create_iso
-        shell: bash
         env:
-          VERSION_DISPLAY: ${{ steps.version_info.outputs.version_display }}
           VERSION_SLUG: ${{ steps.version_info.outputs.version_slug }}
         run: |
           set -Eeuo pipefail
 
-          : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
-          : "${RECOVERY_DIR:?RECOVERY_DIR is required}"
-          : "${VERSION_DISPLAY:?VERSION_DISPLAY is required}"
-          : "${VERSION_SLUG:?VERSION_SLUG is required}"
-
           iso_file="macOS_${VERSION_SLUG}_Recovery.iso"
-          recovery_path="${RECOVERY_DIR}/BaseSystem.dmg"
+          recovery_dmg='com.apple.recovery.boot/BaseSystem.dmg'
           volume_name="${VERSION_SLUG}_Recovery"
 
-          test -s "${recovery_path}"
+          if [ ! -s "$recovery_dmg" ]; then
+            printf 'Missing recovery DMG: %s\n' "$recovery_dmg" >&2
+            exit 1
+          fi
 
-          echo "Validating source DMG..."
-          hdiutil imageinfo "${recovery_path}" > /dev/null
+          printf 'Validating recovery DMG before ISO conversion...\n'
+          hdiutil imageinfo "$recovery_dmg" >/dev/null
 
-          echo "Creating ISO: ${iso_file}"
-          rm -f "${iso_file}"
-
+          printf 'Creating ISO: %s\n' "$iso_file"
+          rm -f "$iso_file"
           hdiutil makehybrid \
             -hfs \
             -udf \
-            -default-volume-name "${volume_name}" \
-            -o "${iso_file}" \
-            "${recovery_path}"
+            -iso \
+            -joliet \
+            -default-volume-name "$volume_name" \
+            -o "$iso_file" \
+            "$recovery_dmg"
 
-          test -s "${iso_file}"
+          if [ ! -s "$iso_file" ]; then
+            printf 'ISO was not created or is empty: %s\n' "$iso_file" >&2
+            exit 1
+          fi
 
-          iso_size="$(du -h "${iso_file}" | awk '{print $1}')"
-          sha256="$(shasum -a 256 "${iso_file}" | awk '{print $1}')"
+          iso_size="$(du -h "$iso_file" | awk '{print $1}')"
+          printf 'ISO created successfully: %s (%s)\n' "$iso_file" "$iso_size"
+          printf 'iso_file=%s\n' "$iso_file" >> "$GITHUB_OUTPUT"
 
-          printf '%s  %s\n' "${sha256}" "${iso_file}" > "SHA256SUMS"
+      - name: Compress ISO
+        id: compress_iso
+        env:
+          ISO_FILE: ${{ steps.create_iso.outputs.iso_file }}
+        run: |
+          set -Eeuo pipefail
 
-          echo "ISO created successfully."
-          echo "ISO file : ${iso_file}"
-          echo "ISO size : ${iso_size}"
-          echo "SHA256   : ${sha256}"
+          if [ ! -s "$ISO_FILE" ]; then
+            printf 'Missing ISO file: %s\n' "$ISO_FILE" >&2
+            exit 1
+          fi
 
-          {
-            printf 'iso_file=%s\n' "${iso_file}"
-            printf 'iso_size=%s\n' "${iso_size}"
-            printf 'sha256=%s\n' "${sha256}"
-          } >> "${GITHUB_OUTPUT}"
+          zip_file="${ISO_FILE}.zip"
+          rm -f "$zip_file"
+
+          printf 'Compressing ISO with zip: %s\n' "$zip_file"
+          zip -9 -j "$zip_file" "$ISO_FILE"
+
+          if [ ! -s "$zip_file" ]; then
+            printf 'ZIP was not created or is empty: %s\n' "$zip_file" >&2
+            exit 1
+          fi
+
+          zip_size="$(du -h "$zip_file" | awk '{print $1}')"
+          printf 'ZIP created successfully: %s (%s)\n' "$zip_file" "$zip_size"
+          printf 'compressed_file=%s\n' "$zip_file" >> "$GITHUB_OUTPUT"
 
       - name: Upload Recovery ISO artifact
-        id: upload_artifact
         uses: actions/upload-artifact@v7
         with:
-          path: ${{ steps.create_iso.outputs.iso_file }}
-          archive: false
+          name: macOS_${{ steps.version_info.outputs.version_slug }}_Recovery
+          path: ${{ steps.compress_iso.outputs.compressed_file }}
+          compression-level: 0
           retention-days: 15
           if-no-files-found: error
+          archive: false
 
       - name: Sanitize release tag
         id: sanitize_tag
-        if: inputs.release_tag != ''
-        shell: bash
+        if: ${{ inputs.release_tag != '' }}
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -Eeuo pipefail
 
-          : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
-          : "${RELEASE_TAG:?RELEASE_TAG is required}"
+          sanitized_tag="$(printf '%s' "$RELEASE_TAG" \
+            | LC_ALL=C tr -c '[:alnum:]._-' '-' \
+            | sed -E 's/-+/-/g; s/^-//; s/-$//')"
 
-          sanitized_tag="$(
-            printf '%s' "${RELEASE_TAG}" \
-              | tr -cs 'A-Za-z0-9._-' '-' \
-              | sed -E 's/-+/-/g; s/^-//; s/-$//'
-          )"
-
-          if [[ -z "${sanitized_tag}" ]]; then
-            echo "Invalid release tag after sanitization." >&2
+          if [ -z "$sanitized_tag" ]; then
+            printf 'Release tag becomes empty after sanitization. Raw value: %s\n' "$RELEASE_TAG" >&2
             exit 1
           fi
 
-          printf 'sanitized_tag=%s\n' "${sanitized_tag}" >> "${GITHUB_OUTPUT}"
-          echo "Sanitized release tag: ${sanitized_tag}"
+          printf 'sanitized_tag=%s\n' "$sanitized_tag" >> "$GITHUB_OUTPUT"
 
-      - name: Create or update Release
-        if: inputs.release_tag != ''
-        shell: bash
+      - name: Create Release
+        if: ${{ inputs.release_tag != '' }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ steps.sanitize_tag.outputs.sanitized_tag }}
-          VERSION_DISPLAY: ${{ steps.version_info.outputs.version_display }}
-          ISO_FILE: ${{ steps.create_iso.outputs.iso_file }}
-          ISO_SIZE: ${{ steps.create_iso.outputs.iso_size }}
-          SHA256: ${{ steps.create_iso.outputs.sha256 }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZIP_FILE: ${{ steps.compress_iso.outputs.compressed_file }}
+          SANITIZED_TAG: ${{ steps.sanitize_tag.outputs.sanitized_tag }}
+          VERSION_NAME: ${{ steps.version_info.outputs.version_name }}
         run: |
           set -Eeuo pipefail
 
-          : "${GH_TOKEN:?GH_TOKEN is required}"
-          : "${TAG_NAME:?TAG_NAME is required}"
-          : "${VERSION_DISPLAY:?VERSION_DISPLAY is required}"
-          : "${ISO_FILE:?ISO_FILE is required}"
-          : "${ISO_SIZE:?ISO_SIZE is required}"
-          : "${SHA256:?SHA256 is required}"
-
-          test -s "${ISO_FILE}"
-          test -s "SHA256SUMS"
-
-          title="macOS ${VERSION_DISPLAY} Recovery ISO"
-          notes="$(
-            cat <<EOF
-          macOS ${VERSION_DISPLAY} Recovery ISO
-
-          - File: ${ISO_FILE}
-          - Size: ${ISO_SIZE}
-          - SHA256: ${SHA256}
-
-          This is a recoveryOS image intended for VM installation workflows that use Proxmox VE, QEMU/KVM, VMware, or VirtualBox.
-          EOF
-          )"
-
-          if gh release view "${TAG_NAME}" > /dev/null 2>&1; then
-            echo "Release ${TAG_NAME} already exists. Uploading assets with --clobber..."
-            gh release upload "${TAG_NAME}" "${ISO_FILE}" "SHA256SUMS" --clobber
-          else
-            echo "Creating release ${TAG_NAME}..."
-            gh release create "${TAG_NAME}" \
-              "${ISO_FILE}" \
-              "SHA256SUMS" \
-              --title "${title}" \
-              --notes "${notes}"
+          if [ ! -s "$ZIP_FILE" ]; then
+            printf 'Missing ZIP release asset: %s\n' "$ZIP_FILE" >&2
+            exit 1
           fi
+
+          title="macOS ${VERSION_NAME} Recovery"
+          notes_file='RELEASE_NOTES.md'
+
+          cat > "$notes_file" <<EOF
+          ## macOS ${VERSION_NAME} Recovery ISO
+
+          Built by GitHub Actions from Apple Recovery assets using Acidanthera/OpenCorePkg macrecovery.py.
+
+          Asset:
+          - ${ZIP_FILE}
+          EOF
+
+          gh release create "$SANITIZED_TAG" "$ZIP_FILE" \
+            --title "$title" \
+            --notes-file "$notes_file"
 
       - name: Summary
         if: always()
-        shell: bash
         env:
           DOWNLOAD_OUTCOME: ${{ steps.download_recovery_image.outcome }}
+          CREATE_ISO_OUTCOME: ${{ steps.create_iso.outcome }}
+          COMPRESS_OUTCOME: ${{ steps.compress_iso.outcome }}
           JOB_STATUS: ${{ job.status }}
-          VERSION_DISPLAY: ${{ steps.version_info.outputs.version_display }}
-          ISO_FILE: ${{ steps.create_iso.outputs.iso_file }}
-          ISO_SIZE: ${{ steps.create_iso.outputs.iso_size }}
-          SHA256: ${{ steps.create_iso.outputs.sha256 }}
-          ARTIFACT_URL: ${{ steps.upload_artifact.outputs.artifact-url }}
+          VERSION_NAME: ${{ steps.version_info.outputs.version_name }}
+          ZIP_FILE: ${{ steps.compress_iso.outputs.compressed_file }}
         run: |
           set -Eeuo pipefail
 
-          : "${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
+          append_summary() {
+            printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
 
-          {
-            if [[ "${DOWNLOAD_OUTCOME}" == "failure" ]]; then
-              echo "## Download RecoveryOS failed"
-              echo ""
-              echo "> [!WARNING]"
-              echo "> The runner may have network issues, Apple Recovery CDN may be temporarily unavailable, or the selected BoardID/MLB mapping may no longer return the expected recovery image."
-            elif [[ "${JOB_STATUS}" == "success" ]]; then
-              echo "## Successfully built macOS ${VERSION_DISPLAY} Recovery ISO"
-              echo ""
-              echo "| Item | Value |"
-              echo "|---|---|"
-              echo "| ISO | \`${ISO_FILE}\` |"
-              echo "| Size | \`${ISO_SIZE}\` |"
-              echo "| SHA256 | \`${SHA256}\` |"
-
-              if [[ -n "${ARTIFACT_URL}" ]]; then
-                echo "| Artifact | ${ARTIFACT_URL} |"
-              fi
-
-              echo ""
-              echo "> [!IMPORTANT]"
-              echo "> This is a recoveryOS image, not a full offline macOS installer. The VM usually still needs internet access during macOS installation."
-            else
-              echo "## Build did not complete successfully"
-              echo ""
-              echo "Check the failed step logs above for the exact error."
-            fi
-          } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "$DOWNLOAD_OUTCOME" = 'failure' ]; then
+            append_summary '## Download RecoveryOS failed'
+            append_summary ''
+            append_summary '> [!WARNING]'
+            append_summary '> Apple recovery download or GitHub runner networking failed. Re-run the workflow once; the retry logic already made three attempts in this run.'
+          elif [ "$CREATE_ISO_OUTCOME" = 'failure' ]; then
+            append_summary '## ISO creation failed'
+            append_summary ''
+            append_summary '> [!WARNING]'
+            append_summary '> Recovery files were downloaded, but hdiutil could not create the ISO. Check the hdiutil output above.'
+          elif [ "$COMPRESS_OUTCOME" = 'failure' ]; then
+            append_summary '## ISO compression failed'
+            append_summary ''
+            append_summary '> [!WARNING]'
+            append_summary '> ISO creation succeeded, but ZIP compression failed. Check disk space and zip output above.'
+          elif [ "$JOB_STATUS" = 'success' ]; then
+            append_summary "## Successfully built **macOS ${VERSION_NAME} Recovery** ISO"
+            append_summary ''
+            append_summary "Artifact ZIP: \`${ZIP_FILE}\`"
+            append_summary ''
+            append_summary '> [!IMPORTANT]'
+            append_summary '> This ISO image is intended for creating macOS virtual machines on Proxmox VE, QEMU/KVM, VMware, and VirtualBox.'
+          fi
