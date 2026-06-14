@@ -9,27 +9,25 @@ name: Build Recovery ISO image
 #   Actions artifact and optionally publish it as a GitHub Release asset.
 #
 # Important implementation notes:
-#   1. The build job is pinned to macos-26-intel instead of macos-latest so the
-#      workflow is not affected by GitHub's moving "latest" macOS label.
-#   2. The old star/fork preflight gate was removed because it could skip the
-#      build job and only print a link to another fork's artifact.
-#   3. All user-controlled inputs are passed through environment variables before
-#      use in shell scripts to avoid shell injection and quoting issues.
-#   4. Tahoe must use macrecovery.py with -os latest. Earlier listed versions use
-#      -os default, matching OpenCorePkg's recovery_urls.txt examples.
-#   5. Release tags are sanitized before use. Empty sanitized tags are rejected.
+#   1. The ISO must be created from the com.apple.recovery.boot directory, not
+#      directly from com.apple.recovery.boot/BaseSystem.dmg. Using BaseSystem.dmg
+#      as hdiutil makehybrid source forces hdiutil to attach/mount Apple's DMG
+#      first and can fail on GitHub-hosted macOS runners with:
+#        hdiutil: makehybrid failed - Operation not permitted
+#   2. Tahoe must use macrecovery.py with -os latest.
+#   3. All workflow inputs are passed through environment variables before use in
+#      shell scripts to avoid quoting and injection problems.
+#   4. Release tags are sanitized before use. Empty sanitized tags are rejected.
 #
 # CHANGELOG
 # ==============================================================================
 # 2026-06-14
-#   - Removed fork/star build-skip logic from preflight.
-#   - Added strict Bash mode and safe quoting for GitHub environment files.
-#   - Pinned macOS build runner to macos-26-intel for stable Intel hdiutil output.
-#   - Added explicit macOS version validation and output mapping.
-#   - Added retry logic and syntax validation for downloaded macrecovery.py.
-#   - Added recovery DMG existence/size validation before hdiutil makehybrid.
-#   - Added artifact name, if-no-files-found: error, and release notes.
-#   - Hardened optional release-tag sanitization and gh release invocation.
+#   - Fixed Sequoia/non-Sonoma ISO creation failure by building ISO from the
+#     recovery folder instead of directly from BaseSystem.dmg.
+#   - Removed unsafe direct use of GitHub expression values inside shell logic.
+#   - Added strict validation for BaseSystem.dmg and BaseSystem.chunklist.
+#   - Added retry logic for macrecovery.py download and RecoveryOS download.
+#   - Kept runner pinned to macos-26-intel for deterministic Intel-based hdiutil.
 # ==============================================================================
 
 on:
@@ -51,7 +49,7 @@ on:
           - 'Mojave'
           - 'High Sierra'
       release_tag:
-        description: 'Optional: tag the build, for example v14.7.6-recovery, to upload it to Releases for long-term storage'
+        description: 'Optional: tag the build, for example v15-recovery, to upload it to Releases for long-term storage'
         required: false
         type: string
 
@@ -263,13 +261,15 @@ jobs:
           set -Eeuo pipefail
 
           recovery_dir='com.apple.recovery.boot'
-          recovery_dmg="$recovery_dir/BaseSystem.dmg"
+          recovery_dmg="${recovery_dir}/BaseSystem.dmg"
+          recovery_chunklist="${recovery_dir}/BaseSystem.chunklist"
 
           printf 'Downloading macOS %s recovery...\n' "$VERSION_NAME"
           rm -rf "$recovery_dir"
 
           for attempt in 1 2 3; do
             printf 'macrecovery attempt %s/3...\n' "$attempt"
+
             if python3 macrecovery.py -b "$BOARD_ID" -m "$MODEL" -os "$OS_TYPE" download; then
               break
             fi
@@ -288,6 +288,12 @@ jobs:
             exit 1
           fi
 
+          if [ ! -s "$recovery_chunklist" ]; then
+            printf 'Recovery chunklist was not created or is empty: %s\n' "$recovery_chunklist" >&2
+            find "$recovery_dir" -maxdepth 2 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
           printf 'Recovery files:\n'
           find "$recovery_dir" -maxdepth 2 -type f -print -exec du -h {} \;
 
@@ -299,27 +305,40 @@ jobs:
           set -Eeuo pipefail
 
           iso_file="macOS_${VERSION_SLUG}_Recovery.iso"
-          recovery_dmg='com.apple.recovery.boot/BaseSystem.dmg'
+          recovery_dir='com.apple.recovery.boot'
+          recovery_dmg="${recovery_dir}/BaseSystem.dmg"
+          recovery_chunklist="${recovery_dir}/BaseSystem.chunklist"
           volume_name="${VERSION_SLUG}_Recovery"
 
-          if [ ! -s "$recovery_dmg" ]; then
-            printf 'Missing recovery DMG: %s\n' "$recovery_dmg" >&2
+          if [ ! -d "$recovery_dir" ]; then
+            printf 'Missing recovery directory: %s\n' "$recovery_dir" >&2
             exit 1
           fi
 
-          printf 'Validating recovery DMG before ISO conversion...\n'
+          if [ ! -s "$recovery_dmg" ]; then
+            printf 'Missing recovery DMG: %s\n' "$recovery_dmg" >&2
+            find "$recovery_dir" -maxdepth 2 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          if [ ! -s "$recovery_chunklist" ]; then
+            printf 'Missing recovery chunklist: %s\n' "$recovery_chunklist" >&2
+            find "$recovery_dir" -maxdepth 2 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          printf 'Validating downloaded recovery DMG metadata...\n'
           hdiutil imageinfo "$recovery_dmg" >/dev/null
 
-          printf 'Creating ISO: %s\n' "$iso_file"
+          printf 'Creating ISO from recovery folder, not by mounting BaseSystem.dmg...\n'
           rm -f "$iso_file"
+
           hdiutil makehybrid \
-            -hfs \
-            -udf \
             -iso \
             -joliet \
             -default-volume-name "$volume_name" \
             -o "$iso_file" \
-            "$recovery_dmg"
+            "$recovery_dir"
 
           if [ ! -s "$iso_file" ]; then
             printf 'ISO was not created or is empty: %s\n' "$iso_file" >&2
@@ -404,14 +423,14 @@ jobs:
           title="macOS ${VERSION_NAME} Recovery"
           notes_file='RELEASE_NOTES.md'
 
-          cat > "$notes_file" <<EOF
-          ## macOS ${VERSION_NAME} Recovery ISO
-
-          Built by GitHub Actions from Apple Recovery assets using Acidanthera/OpenCorePkg macrecovery.py.
-
-          Asset:
-          - ${ZIP_FILE}
-          EOF
+          {
+            printf '## macOS %s Recovery ISO\n' "$VERSION_NAME"
+            printf '\n'
+            printf 'Built by GitHub Actions from Apple Recovery assets using Acidanthera/OpenCorePkg macrecovery.py.\n'
+            printf '\n'
+            printf 'Asset:\n'
+            printf '- %s\n' "$ZIP_FILE"
+          } > "$notes_file"
 
           gh release create "$SANITIZED_TAG" "$ZIP_FILE" \
             --title "$title" \
@@ -454,5 +473,5 @@ jobs:
             append_summary "Artifact ZIP: \`${ZIP_FILE}\`"
             append_summary ''
             append_summary '> [!IMPORTANT]'
-            append_summary '> This ISO image is intended for creating macOS virtual machines on Proxmox VE, QEMU/KVM, VMware, and VirtualBox.'
+            append_summary '> This ISO image is intended for creating macOS virtual machines on Proxmox VE, QEMU/KVM, VMware, and VirtualBox with a proper OpenCore/bootloader setup.'
           fi
