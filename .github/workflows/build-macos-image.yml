@@ -9,7 +9,7 @@ name: Build Full Installer ISO/DMG image
 #
 # Scope:
 #   - ISO output is intended for virtual machine installation workflows.
-#   - DMG IMG output is intended for raw flashing to USB or conversion to another
+#   - DMG output is intended for raw flashing to USB or conversion to another
 #     virtual-disk format when required.
 #
 # Design notes:
@@ -25,11 +25,14 @@ name: Build Full Installer ISO/DMG image
 #      workflows are commonly Intel-oriented.
 #   5. Output detection is strict:
 #        - image_format=iso accepts exactly one *.iso file.
-#        - image_format=dmg accepts exactly one *.dmg.img file.
-#      This avoids unsafe wildcard expansion such as basename *.iso.
+#        - image_format=dmg accepts exactly one *.dmg.img or *.dmg file.
+#      DMG output is normalized before upload so the final artifact filename ends
+#      with exactly one .dmg extension, never .dmg.img and never .dmg.dmg.
 #   6. actions/upload-artifact@v7 with archive:false supports unzipped single-file
 #      upload. Therefore this workflow uploads exactly one output file.
-#   7. mkmaciso is syntax-checked with bash -n before execution.
+#   7. In direct-upload mode with archive:false, the artifact name follows the
+#      uploaded local filename. Therefore the DMG file is renamed before upload.
+#   8. mkmaciso is syntax-checked with bash -n before execution.
 #
 # Operational notes:
 #   - Full macOS installers are large. If the runner does not have enough free
@@ -40,6 +43,14 @@ name: Build Full Installer ISO/DMG image
 # ==============================================================================
 # CHANGELOG
 # ==============================================================================
+# 2026-06-18
+#   - Added DMG output filename normalization before artifact upload.
+#   - Converted mkmaciso *.dmg.img output to a user-facing *.dmg filename.
+#   - Added protection against duplicate trailing .dmg.dmg extension.
+#   - Updated DOCNOTE to document direct-upload filename behavior.
+#   - Updated DMG summary wording from DMG IMG to DMG.
+#   - Kept ISO output behavior unchanged.
+#
 # 2026-06-14
 #   - Removed third-party fork/stargazer preflight search logic.
 #   - Added explicit input validation for macOS version and image format.
@@ -232,12 +243,49 @@ jobs:
             printf '%s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
           }
 
+          normalize_dmg_name() {
+            original_name="$1"
+            normalized_name="$original_name"
+
+            # mkmaciso can create *.dmg.img for DMG output.
+            # Final user-facing artifact must end with exactly one .dmg.
+            case "$normalized_name" in
+              *.img)
+                normalized_name="${normalized_name%.img}"
+                ;;
+            esac
+
+            # Collapse repeated trailing .dmg extensions:
+            # file.dmg.dmg      -> file.dmg
+            # file.dmg.dmg.dmg  -> file.dmg
+            while :; do
+              case "$normalized_name" in
+                *.dmg.dmg)
+                  normalized_name="${normalized_name%.dmg}"
+                  ;;
+                *)
+                  break
+                  ;;
+              esac
+            done
+
+            case "$normalized_name" in
+              *.dmg)
+                ;;
+              *)
+                normalized_name="${normalized_name}.dmg"
+                ;;
+            esac
+
+            printf '%s\n' "$normalized_name"
+          }
+
           case "$IMAGE_FORMAT" in
             iso)
               expected_glob='*.iso'
               ;;
             dmg)
-              expected_glob='*.dmg.img'
+              expected_glob='*.dmg.img or *.dmg'
               ;;
             *)
               printf 'Unsupported image format: %s\n' "$IMAGE_FORMAT" >&2
@@ -264,7 +312,7 @@ jobs:
           if [ "$IMAGE_FORMAT" = 'iso' ]; then
             output_files=( ./*.iso )
           else
-            output_files=( ./*.dmg.img )
+            output_files=( ./*.dmg.img ./*.dmg )
           fi
 
           if [ "${#output_files[@]}" -eq 0 ]; then
@@ -285,6 +333,24 @@ jobs:
           if [ ! -s "$image_path" ]; then
             printf 'Output file is missing or empty: %s\n' "$image_path" >&2
             exit 1
+          fi
+
+          if [ "$IMAGE_FORMAT" = 'dmg' ]; then
+            final_image_name="$(normalize_dmg_name "$image_name")"
+            final_image_path="./$final_image_name"
+
+            if [ "$final_image_name" != "$image_name" ]; then
+              if [ -e "$final_image_path" ]; then
+                printf 'Cannot rename DMG output because target already exists: %s\n' "$final_image_path" >&2
+                exit 1
+              fi
+
+              printf 'Renaming DMG output: %s -> %s\n' "$image_name" "$final_image_name"
+              mv "$image_path" "$final_image_path"
+
+              image_path="$final_image_path"
+              image_name="$final_image_name"
+            fi
           fi
 
           image_size="$(du -h "$image_path" | awk '{print $1}')"
@@ -370,6 +436,6 @@ jobs:
               append_summary '> This ISO image is intended for creating macOS virtual machines on Proxmox VE, QEMU/KVM, VMware, and VirtualBox.'
             else
               append_summary '> [!IMPORTANT]'
-              append_summary '> This DMG IMG image is intended for flashing to a USB drive using Rufus on Windows or `dd` on Linux.'
+              append_summary '> This DMG image is intended for flashing to a USB drive using Rufus on Windows or `dd` on Linux.'
             fi
           fi
